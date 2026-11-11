@@ -2,10 +2,12 @@ package helpers
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/CycloneDX/cyclonedx-go"
 
+	"github.com/anchore/syft/internal/log"
 	"github.com/anchore/syft/syft/artifact"
 	"github.com/anchore/syft/syft/file"
 	"github.com/anchore/syft/syft/format/internal"
@@ -36,17 +38,19 @@ func ToSyftModel(bom *cyclonedx.BOM) (*sbom.SBOM, error) {
 	}
 
 	if bom.Components != nil {
-		collectFiles(*bom.Components, nil, s)
+		collectFiles(*bom.Components, nil, s, idMap)
 	}
 
 	collectRelationships(bom, s, idMap)
+	s.Relationships = append(s.Relationships, collectEvidenceRelationships(bom, idMap)...)
 
 	return s, nil
 }
 
 // collectFiles decodes file components, named relative to the scan root; a file component nested in
-// another is an entry of that archive.
-func collectFiles(components []cyclonedx.Component, container *file.Coordinates, s *sbom.SBOM) {
+// another is an entry of that archive. The BOM-Ref of every file component is registered in idMap so that
+// encoded relationship edges can resolve back to the file.
+func collectFiles(components []cyclonedx.Component, container *file.Coordinates, s *sbom.SBOM, idMap map[string]any) {
 	for i := range components {
 		component := &components[i]
 		var coordinates *file.Coordinates
@@ -62,6 +66,12 @@ func collectFiles(components []cyclonedx.Component, container *file.Coordinates,
 				c = nested
 			}
 			coordinates = &c
+			ref := component.BOMRef
+			if ref == "" {
+				ref = string(c.ID())
+			}
+			idMap[ref] = c
+			idMap[string(c.ID())] = c
 			if s.Artifacts.FileMetadata == nil {
 				s.Artifacts.FileMetadata = map[file.Coordinates]file.Metadata{}
 			}
@@ -74,7 +84,7 @@ func collectFiles(components []cyclonedx.Component, container *file.Coordinates,
 			}
 		}
 		if component.Components != nil {
-			collectFiles(*component.Components, coordinates, s)
+			collectFiles(*component.Components, coordinates, s, idMap)
 		}
 	}
 }
@@ -259,6 +269,138 @@ func collectRelationships(bom *cyclonedx.BOM, s *sbom.SBOM, idMap map[string]any
 			})
 		}
 	}
+}
+
+// collectEvidenceRelationships reconstructs the contains and evident-by edges carried as properties on their
+// source components (see RelationshipPropertyNamespace). The component BOM-Ref is the relationship source and
+// each edge property names its target. Edges whose endpoint BOM-Refs cannot be resolved, or whose type is not
+// recognized, are ignored rather than producing dangling relationships.
+func collectEvidenceRelationships(bom *cyclonedx.BOM, idMap map[string]any) (out []artifact.Relationship) {
+	if bom.Components == nil {
+		return nil
+	}
+
+	var walk func(components []cyclonedx.Component)
+	walk = func(components []cyclonedx.Component) {
+		for i := range components {
+			component := &components[i]
+			out = append(out, decodeComponentEvidenceEdges(*component, idMap)...)
+			if component.Components != nil {
+				walk(*component.Components)
+			}
+		}
+	}
+
+	if bom.Metadata != nil && bom.Metadata.Component != nil {
+		walk([]cyclonedx.Component{*bom.Metadata.Component})
+	}
+	walk(*bom.Components)
+
+	return out
+}
+
+func decodeComponentEvidenceEdges(component cyclonedx.Component, idMap map[string]any) (out []artifact.Relationship) {
+	if component.Properties == nil || component.BOMRef == "" {
+		return nil
+	}
+
+	type edge struct {
+		typ    artifact.RelationshipType
+		toRef  string
+		hasTyp bool
+	}
+	edges := map[string]*edge{}
+	for _, property := range *component.Properties {
+		index, field, ok := parseRelationshipPropertyName(property.Name)
+		if !ok {
+			continue
+		}
+		current := edges[index]
+		if current == nil {
+			current = &edge{}
+			edges[index] = current
+		}
+		switch field {
+		case relationshipTypePropertySuffix:
+			current.typ = artifact.RelationshipType(property.Value)
+			current.hasTyp = true
+		case relationshipToPropertySuffix:
+			current.toRef = property.Value
+		}
+	}
+
+	indices := make([]string, 0, len(edges))
+	for index := range edges {
+		indices = append(indices, index)
+	}
+	sort.Strings(indices)
+
+	from, fromOk := resolveRelationshipEndpoint(component.BOMRef, idMap)
+	if !fromOk {
+		return nil
+	}
+
+	for _, index := range indices {
+		current := edges[index]
+		if !current.hasTyp || !isDecodableEvidenceRelationship(current.typ) || current.toRef == "" {
+			continue
+		}
+		to, toOk := resolveRelationshipEndpoint(current.toRef, idMap)
+		if !toOk {
+			log.Debugf("unable to resolve CycloneDX evidence relationship target, ignoring: %+v", current)
+			continue
+		}
+		out = append(out, artifact.Relationship{
+			From: from,
+			To:   to,
+			Type: current.typ,
+		})
+	}
+
+	return out
+}
+
+// parseRelationshipPropertyName splits a property name of the form
+// "<RelationshipPropertyNamespace>:<index>:<field>" into its edge index and field suffix. Names outside the
+// syft relationship namespace and malformed names are rejected.
+func parseRelationshipPropertyName(name string) (index, field string, ok bool) {
+	prefix := RelationshipPropertyNamespace + ":"
+	rest, found := strings.CutPrefix(name, prefix)
+	if !found {
+		return "", "", false
+	}
+	separator := strings.LastIndex(rest, ":")
+	if separator <= 0 || separator == len(rest)-1 {
+		return "", "", false
+	}
+	index, field = rest[:separator], rest[separator:]
+	switch field {
+	case relationshipTypePropertySuffix, relationshipToPropertySuffix:
+	default:
+		return "", "", false
+	}
+	return index, field, true
+}
+
+func isDecodableEvidenceRelationship(ty artifact.RelationshipType) bool {
+	switch ty {
+	case artifact.ContainsRelationship, artifact.EvidentByRelationship:
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveRelationshipEndpoint(ref string, idMap map[string]any) (artifact.Identifiable, bool) {
+	endpoint, exists := idMap[ref]
+	if !exists {
+		return nil, false
+	}
+	identifiable, ok := PtrToStruct(endpoint).(artifact.Identifiable)
+	if !ok {
+		return nil, false
+	}
+	return identifiable, true
 }
 
 func extractComponents(meta *cyclonedx.Metadata) source.Description {

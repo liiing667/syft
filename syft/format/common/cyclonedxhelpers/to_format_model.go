@@ -57,6 +57,8 @@ func ToFormatModel(s sbom.SBOM) *cyclonedx.BOM {
 	components = append(components, toFileComponents(s.Artifacts, entries, top)...)
 	cdxBOM.Components = &components
 
+	attachRelationshipProperties(cdxBOM.Components, s.Relationships)
+
 	dependencies := toDependencies(s.Relationships)
 	if len(dependencies) > 0 {
 		cdxBOM.Dependencies = &dependencies
